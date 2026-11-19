@@ -1,3 +1,3 @@
 python-telegram-bot>=21.0
-instagrapi
+instagrapi>=3.1.0
 psutil
