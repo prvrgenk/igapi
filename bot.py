@@ -116,7 +116,6 @@ BASE_TEMPLATE = """<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀ�
 
 MAX_RETRIES = 5
 
-# Modern IG Android build profiles to counter "out of date" rejections
 IG_APP_PROFILES = [
     {
         "app_version": "312.0.0.29.111",
@@ -286,7 +285,6 @@ def apply_fresh_ig_headers(client: Client, profile_idx: int | None = None):
     )
     client.delay_range = [0, 0]
 
-    # Update instagrapi's internal app/device attributes when available
     if hasattr(client, "app_version"):
         client.app_version = prof["app_version"]
     if hasattr(client, "version_code"):
@@ -337,10 +335,9 @@ def clean_session_id_input(raw: str) -> str:
 def resolve_username_from_client(client: Client, fallback: str = "") -> str:
     if fallback:
         return fallback.lstrip("@")
-    for attr in ("username",):
-        u = getattr(client, attr, None)
-        if isinstance(u, str) and u.strip():
-            return u.strip().lstrip("@")
+    u = getattr(client, "username", None)
+    if isinstance(u, str) and u.strip():
+        return u.strip().lstrip("@")
     try:
         info = client.account_info()
         u = getattr(info, "username", None)
@@ -827,7 +824,7 @@ async def start_new_login_from_callback(update: Update, context: ContextTypes.DE
     return STATE_USERNAME
 
 
-async start_sid_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_sid_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
@@ -844,7 +841,7 @@ async start_sid_login_from_callback(update: Update, context: ContextTypes.DEFAUL
     return STATE_SESSION_ID
 
 
-async receive_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
 
@@ -877,7 +874,7 @@ async receive_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async use_saved_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def use_saved_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
@@ -910,7 +907,7 @@ async use_saved_account_callback(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-async receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
 
@@ -935,7 +932,7 @@ async receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STATE_PASSWORD
 
 
-async receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_authorized(uid):
         return ConversationHandler.END
@@ -997,7 +994,7 @@ async receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_authorized(uid):
         return ConversationHandler.END
