@@ -811,7 +811,7 @@ async def show_login_choices(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return STATE_USERNAME
 
 
-async start_new_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_new_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
