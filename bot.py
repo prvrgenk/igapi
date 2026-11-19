@@ -116,15 +116,56 @@ BASE_TEMPLATE = """<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀ�
 
 MAX_RETRIES = 5
 
+# Modern IG Android build profiles to counter "out of date" rejections
+IG_APP_PROFILES = [
+    {
+        "app_version": "312.0.0.29.111",
+        "version_code": "538748192",
+        "android_version": 33,
+        "android_release": "13",
+        "dpi": "420dpi",
+        "resolution": "1080x2400",
+        "manufacturer": "Samsung",
+        "device": "SM-S918B",
+        "model": "SM-S918B",
+        "cpu": "qcom",
+    },
+    {
+        "app_version": "315.0.0.25.109",
+        "version_code": "544912830",
+        "android_version": 34,
+        "android_release": "14",
+        "dpi": "440dpi",
+        "resolution": "1080x2400",
+        "manufacturer": "Google",
+        "device": "husky",
+        "model": "Pixel 8 Pro",
+        "cpu": "tensor",
+    },
+    {
+        "app_version": "310.0.0.32.104",
+        "version_code": "534119022",
+        "android_version": 33,
+        "android_release": "13",
+        "dpi": "480dpi",
+        "resolution": "1080x2340",
+        "manufacturer": "OnePlus",
+        "device": "CPH2451",
+        "model": "CPH2451",
+        "cpu": "qcom",
+    },
+]
+
 # Conversation states
 (
     STATE_USERNAME,
     STATE_PASSWORD,
     STATE_2FA,
+    STATE_SESSION_ID,
     STATE_MANUAL_THREADS,
     STATE_TARGET,
     STATE_EDIT_TEMPLATE,
-) = range(6)
+) = range(7)
 
 active_tasks = {}
 tasks_lock = threading.Lock()
@@ -148,7 +189,7 @@ def load_saved_accounts() -> dict:
             return {}
 
 
-def register_saved_account(username: str, ig_user_id=None):
+def register_saved_account(username: str, ig_user_id=None, auth_method: str = "password"):
     with store_lock:
         accounts = {}
         if os.path.exists(ACCOUNTS_FILE):
@@ -160,9 +201,11 @@ def register_saved_account(username: str, ig_user_id=None):
             except Exception:
                 accounts = {}
 
+        prev = accounts.get(username, {})
         accounts[username] = {
             "username": username,
-            "ig_user_id": ig_user_id,
+            "ig_user_id": ig_user_id or prev.get("ig_user_id"),
+            "auth_method": auth_method,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
@@ -218,7 +261,219 @@ def reset_active_template():
                 pass
 
 
-# ======================== HELPERS ========================
+# ======================== IG VERSION & SESSION HELPERS ========================
+
+def is_outdated_app_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(
+        phrase in msg
+        for phrase in (
+            "out of date",
+            "outdated",
+            "update your app",
+            "upgrade your app",
+            "client is too old",
+            "app version",
+        )
+    )
+
+
+def apply_fresh_ig_headers(client: Client, profile_idx: int | None = None):
+    prof = (
+        IG_APP_PROFILES[profile_idx % len(IG_APP_PROFILES)]
+        if profile_idx is not None
+        else random.choice(IG_APP_PROFILES)
+    )
+    client.delay_range = [0, 0]
+
+    # Update instagrapi's internal app/device attributes when available
+    if hasattr(client, "app_version"):
+        client.app_version = prof["app_version"]
+    if hasattr(client, "version_code"):
+        client.version_code = prof["version_code"]
+    if hasattr(client, "android_version"):
+        client.android_version = prof["android_version"]
+    if hasattr(client, "android_release"):
+        client.android_release = prof["android_release"]
+    if hasattr(client, "phone_dpi"):
+        client.phone_dpi = prof["dpi"]
+    if hasattr(client, "phone_resolution"):
+        client.phone_resolution = prof["resolution"]
+    if hasattr(client, "phone_manufacturer"):
+        client.phone_manufacturer = prof["manufacturer"]
+    if hasattr(client, "phone_device"):
+        client.phone_device = prof["device"]
+    if hasattr(client, "phone_model"):
+        client.phone_model = prof["model"]
+    if hasattr(client, "cpu"):
+        client.cpu = prof["cpu"]
+
+    ua = (
+        f"Instagram {prof['app_version']} Android "
+        f"({prof['android_version']}/{prof['android_release']}; "
+        f"{prof['dpi']}; {prof['resolution']}; {prof['manufacturer']}; "
+        f"{prof['device']}; {prof['model']}; {prof['cpu']}; en_US; {prof['version_code']})"
+    )
+    try:
+        client.set_user_agent(ua)
+    except Exception:
+        pass
+    try:
+        if hasattr(client, "private") and hasattr(client.private, "headers"):
+            client.private.headers["User-Agent"] = ua
+            client.private.headers["X-IG-App-ID"] = "936619743392459"
+    except Exception:
+        pass
+
+
+def clean_session_id_input(raw: str) -> str:
+    val = raw.strip().strip('"').strip("'")
+    if "sessionid=" in val:
+        part = val.split("sessionid=", 1)[1]
+        val = part.split(";", 1)[0].strip()
+    return val
+
+
+def resolve_username_from_client(client: Client, fallback: str = "") -> str:
+    if fallback:
+        return fallback.lstrip("@")
+    for attr in ("username",):
+        u = getattr(client, attr, None)
+        if isinstance(u, str) and u.strip():
+            return u.strip().lstrip("@")
+    try:
+        info = client.account_info()
+        u = getattr(info, "username", None)
+        if u:
+            return str(u).strip().lstrip("@")
+    except Exception:
+        pass
+    try:
+        if getattr(client, "user_id", None):
+            uinfo = client.user_info(client.user_id)
+            u = getattr(uinfo, "username", None)
+            if u:
+                return str(u).strip().lstrip("@")
+    except Exception:
+        pass
+    return f"user_{getattr(client, 'user_id', 'session')}"
+
+
+def build_client_with_session(username: str | None = None, profile_idx: int | None = None) -> Client:
+    client = Client()
+    apply_fresh_ig_headers(client, profile_idx=profile_idx)
+    if username:
+        session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
+        if os.path.exists(session_path):
+            try:
+                client.load_settings(session_path)
+                apply_fresh_ig_headers(client, profile_idx=profile_idx)
+            except Exception:
+                pass
+    return client
+
+
+def save_client_session(client: Client, username: str, auth_method: str = "password"):
+    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
+    try:
+        client.dump_settings(session_path)
+        register_saved_account(username, getattr(client, "user_id", None), auth_method=auth_method)
+    except Exception:
+        pass
+
+
+def login_with_password_and_retry(client: Client, username: str, password: str, code: str | None = None):
+    last_exc = None
+    for idx in range(len(IG_APP_PROFILES)):
+        if idx > 0:
+            apply_fresh_ig_headers(client, profile_idx=idx)
+        try:
+            if code:
+                client.login(username, password, verification_code=code)
+            else:
+                client.login(username, password)
+            return client
+        except TwoFactorRequired:
+            raise
+        except BadPassword:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
+                continue
+            raise
+    raise last_exc
+
+
+def login_with_session_id_sync(session_id: str) -> tuple[Client, str]:
+    cleaned = clean_session_id_input(session_id)
+    if not cleaned:
+        raise ValueError("Session ID cannot be empty.")
+
+    last_exc = None
+    for idx in range(len(IG_APP_PROFILES)):
+        client = Client()
+        apply_fresh_ig_headers(client, profile_idx=idx)
+        try:
+            client.login_by_sessionid(cleaned)
+            if not getattr(client, "user_id", None):
+                profile = client.account_info()
+                if getattr(profile, "pk", None):
+                    client.user_id = int(profile.pk)
+            if not getattr(client, "user_id", None):
+                raise RuntimeError("Session ID did not authenticate a valid user account.")
+            uname = resolve_username_from_client(client)
+            return client, uname
+        except Exception as exc:
+            last_exc = exc
+            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
+                continue
+            raise
+    raise last_exc
+
+
+def resume_saved_account_sync(username: str) -> Client:
+    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
+    if not os.path.exists(session_path):
+        raise RuntimeError(f"Saved session file for @{username} not found.")
+
+    last_exc = None
+    for idx in range(len(IG_APP_PROFILES)):
+        client = Client()
+        apply_fresh_ig_headers(client, profile_idx=idx)
+        try:
+            client.load_settings(session_path)
+            apply_fresh_ig_headers(client, profile_idx=idx)
+            profile = client.account_info()
+            if not getattr(profile, "pk", None) and not getattr(client, "user_id", None):
+                raise RuntimeError("Saved session is no longer valid.")
+            client.dump_settings(session_path)
+            return client
+        except Exception as exc:
+            last_exc = exc
+            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
+                continue
+            raise
+    raise last_exc
+
+
+def fetch_threads_sync(client: Client):
+    threads = client.direct_threads(amount=20)
+    items = []
+    for t in threads:
+        if getattr(t, "thread_title", None):
+            title = t.thread_title
+        elif getattr(t, "users", None):
+            usernames = [u.username for u in t.users if getattr(u, "username", None)]
+            title = ", ".join(usernames) if usernames else "Direct Chat"
+        else:
+            title = "Unnamed Thread"
+        tag = "GC" if getattr(t, "is_group", False) else "DM"
+        items.append({"id": str(t.id), "label": f"[{tag}] {title[:26]}"})
+    return items
+
+
+# ======================== TASK & WORKER HELPERS ========================
 
 def is_authorized(user_id: int) -> bool:
     if not ADMIN_IDS:
@@ -299,7 +554,7 @@ def send_message_with_retry(client: Client, thread_id: int, message: str, task_i
             time.sleep(3600)
         except (ClientForbiddenError, LoginRequired):
             set_task_running(task_id, False)
-            update_task_log(task_id, "🔐 Session Expired! Task killed.")
+            update_task_log(task_id, "🔐 Session Expired/Forbidden! Task killed.")
             return False
         except Exception as exc:
             wait = 30 * attempt
@@ -365,58 +620,6 @@ def worker_thread(task_id: str):
     update_task_log(task_id, "🛑 Task has been safely stopped.")
 
 
-def build_client_with_session(username: str) -> Client:
-    client = Client()
-    client.delay_range = [0, 0]
-    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
-    if os.path.exists(session_path):
-        try:
-            client.load_settings(session_path)
-        except Exception:
-            pass
-    return client
-
-
-def save_client_session(client: Client, username: str):
-    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
-    try:
-        client.dump_settings(session_path)
-        register_saved_account(username, getattr(client, "user_id", None))
-    except Exception:
-        pass
-
-
-def resume_saved_account_sync(username: str) -> Client:
-    session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
-    if not os.path.exists(session_path):
-        raise RuntimeError(f"Saved session file for @{username} not found.")
-    client = Client()
-    client.delay_range = [0, 0]
-    client.load_settings(session_path)
-    # Verify session is still valid by fetching current user info
-    profile = client.account_info()
-    if not getattr(profile, "pk", None) and not getattr(client, "user_id", None):
-        raise RuntimeError("Saved session is no longer valid.")
-    client.dump_settings(session_path)
-    return client
-
-
-def fetch_threads_sync(client: Client):
-    threads = client.direct_threads(amount=20)
-    items = []
-    for t in threads:
-        if getattr(t, "thread_title", None):
-            title = t.thread_title
-        elif getattr(t, "users", None):
-            usernames = [u.username for u in t.users if getattr(u, "username", None)]
-            title = ", ".join(usernames) if usernames else "Direct Chat"
-        else:
-            title = "Unnamed Thread"
-        tag = "GC" if getattr(t, "is_group", False) else "DM"
-        items.append({"id": str(t.id), "label": f"[{tag}] {title[:26]}"})
-    return items
-
-
 # ======================== KEYBOARDS & UI ========================
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -441,7 +644,8 @@ def login_choice_keyboard() -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(f"⚡ Use Saved: @{uname}", callback_data=f"use_saved:{uname}")
         ])
-    rows.append([InlineKeyboardButton("🆕 New Username & Password Login", callback_data="start_new_login")])
+    rows.append([InlineKeyboardButton("🔑 Username & Password (with 2FA)", callback_data="start_new_login")])
+    rows.append([InlineKeyboardButton("🍪 Login via Session ID", callback_data="start_sid_login")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_home")])
     return InlineKeyboardMarkup(rows)
 
@@ -454,7 +658,8 @@ def accounts_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"⚡ Use @{uname}", callback_data=f"use_saved:{uname}"),
             InlineKeyboardButton(f"🗑️ Remove @{uname}", callback_data=f"del_acc:{uname}"),
         ])
-    rows.append([InlineKeyboardButton("➕ Login New Account", callback_data="start_new_login")])
+    rows.append([InlineKeyboardButton("🔑 Login Username/Password", callback_data="start_new_login")])
+    rows.append([InlineKeyboardButton("🍪 Login via Session ID", callback_data="start_sid_login")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_home")])
     return InlineKeyboardMarkup(rows)
 
@@ -598,22 +803,22 @@ async def show_login_choices(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     await query.edit_message_text(
-        "🔐 <b>Select Account Source</b>\n\n"
-        "Reuse a saved account session or log in with a new username & password:",
+        "🔐 <b>Select Login Method</b>\n\n"
+        "Reuse a saved account, log in with username/password (with 2FA), or authenticate via Session ID:",
         reply_markup=login_choice_keyboard(),
         parse_mode="HTML",
     )
     return STATE_USERNAME
 
 
-async def start_new_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async start_new_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
         await query.edit_message_text("⛔ Unauthorized.")
         return ConversationHandler.END
 
-    context.user_data["login_flow"] = {}
+    context.user_data["login_flow"] = {"auth_method": "password"}
     await query.edit_message_text(
         "👤 <b>Step 1/4: Instagram Username</b>\n\n"
         "Send your Instagram username (or /cancel to abort):",
@@ -622,7 +827,57 @@ async def start_new_login_from_callback(update: Update, context: ContextTypes.DE
     return STATE_USERNAME
 
 
-async def use_saved_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async start_sid_login_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_authorized(query.from_user.id):
+        await query.edit_message_text("⛔ Unauthorized.")
+        return ConversationHandler.END
+
+    context.user_data["login_flow"] = {"auth_method": "sessionid"}
+    await query.edit_message_text(
+        "🍪 <b>Login via Session ID</b>\n\n"
+        "Paste your Instagram <code>sessionid</code> cookie value (or full <code>sessionid=...</code> string).\n"
+        "Your message will be deleted right after reading.",
+        parse_mode="HTML",
+    )
+    return STATE_SESSION_ID
+
+
+async receive_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return ConversationHandler.END
+
+    raw_sid = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if not raw_sid:
+        await update.message.reply_text("❌ Session ID cannot be empty. Paste it again or /cancel:")
+        return STATE_SESSION_ID
+
+    status_msg = await update.message.reply_text(
+        "🔄 Authenticating with Session ID (with updated IG app headers)..."
+    )
+
+    try:
+        client, username = await asyncio.to_thread(login_with_session_id_sync, raw_sid)
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ Session ID login failed: <code>{type(exc).__name__}: {str(exc)[:180]}</code>",
+            reply_markup=login_choice_keyboard(),
+            parse_mode="HTML",
+        )
+        return STATE_USERNAME
+
+    return await finish_auth_and_show_threads(
+        status_msg, context, client, username, auth_method="sessionid"
+    )
+
+
+async use_saved_account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
@@ -630,6 +885,9 @@ async def use_saved_account_callback(update: Update, context: ContextTypes.DEFAU
         return ConversationHandler.END
 
     username = query.data.split(":", 1)[1]
+    meta = load_saved_accounts().get(username, {})
+    auth_method = meta.get("auth_method", "password")
+
     status_msg = await query.edit_message_text(
         f"⚡ Resuming saved session for <code>@{username}</code>...",
         parse_mode="HTML",
@@ -641,16 +899,18 @@ async def use_saved_account_callback(update: Update, context: ContextTypes.DEFAU
         await status_msg.edit_text(
             f"⚠️ Saved session for <code>@{username}</code> could not be resumed "
             f"(<code>{str(exc)[:140]}</code>).\n"
-            "Try logging in fresh with username & password.",
+            "Try logging in again using Username/Password or Session ID.",
             reply_markup=login_choice_keyboard(),
             parse_mode="HTML",
         )
         return STATE_USERNAME
 
-    return await finish_auth_and_show_threads(status_msg, context, client, username)
+    return await finish_auth_and_show_threads(
+        status_msg, context, client, username, auth_method=auth_method
+    )
 
 
-async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
 
@@ -659,7 +919,7 @@ async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Username cannot be empty. Send again:")
         return STATE_USERNAME
 
-    flow = context.user_data.setdefault("login_flow", {})
+    flow = context.user_data.setdefault("login_flow", {"auth_method": "password"})
     flow["username"] = username
 
     try:
@@ -675,7 +935,7 @@ async def receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STATE_PASSWORD
 
 
-async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_authorized(uid):
         return ConversationHandler.END
@@ -690,18 +950,17 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Password cannot be empty. Send again:")
         return STATE_PASSWORD
 
-    flow = context.user_data.setdefault("login_flow", {})
+    flow = context.user_data.setdefault("login_flow", {"auth_method": "password"})
     username = flow.get("username", "")
     status_msg = await update.message.reply_text(
         f"🔄 Logging into <code>@{username}</code>...",
         parse_mode="HTML",
     )
 
-    client = build_client_with_session(username)
+    client = build_client_with_session(username, profile_idx=0)
 
     def _attempt_login():
-        client.login(username, password)
-        return client
+        return login_with_password_and_retry(client, username, password, code=None)
 
     try:
         logged_client = await asyncio.to_thread(_attempt_login)
@@ -733,10 +992,12 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    return await finish_auth_and_show_threads(status_msg, context, logged_client, username)
+    return await finish_auth_and_show_threads(
+        status_msg, context, logged_client, username, auth_method="password"
+    )
 
 
-async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_authorized(uid):
         return ConversationHandler.END
@@ -761,8 +1022,7 @@ async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = pending["password"]
 
     def _verify_2fa():
-        client.login(username, password, verification_code=code)
-        return client
+        return login_with_password_and_retry(client, username, password, code=code)
 
     try:
         logged_client = await asyncio.to_thread(_verify_2fa)
@@ -775,10 +1035,14 @@ async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STATE_2FA
 
     pending_logins.pop(uid, None)
-    return await finish_auth_and_show_threads(status_msg, context, logged_client, username)
+    return await finish_auth_and_show_threads(
+        status_msg, context, logged_client, username, auth_method="password+2fa"
+    )
 
 
-async def finish_auth_and_show_threads(status_msg, context, client: Client, username: str):
+async def finish_auth_and_show_threads(
+    status_msg, context, client: Client, username: str, auth_method: str = "password"
+):
     if not getattr(client, "user_id", None):
         await status_msg.edit_text(
             "❌ Login did not return an Instagram user ID.",
@@ -786,7 +1050,7 @@ async def finish_auth_and_show_threads(status_msg, context, client: Client, user
         )
         return ConversationHandler.END
 
-    await asyncio.to_thread(save_client_session, client, username)
+    await asyncio.to_thread(save_client_session, client, username, auth_method)
 
     flow = context.user_data.setdefault("login_flow", {})
     flow["client"] = client
@@ -957,7 +1221,7 @@ async def start_template_edit(update: Update, context: ContextTypes.DEFAULT_TYPE
     return STATE_EDIT_TEMPLATE
 
 
-async def receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
 
@@ -975,7 +1239,7 @@ async def receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
@@ -998,8 +1262,8 @@ async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = ["💾 <b>Saved Accounts</b>\n"]
             for uname, meta in sorted(accounts.items()):
                 lines.append(
-                    f"• <code>@{uname}</code> (IG ID: <code>{meta.get('ig_user_id') or 'N/A'}</code>) — "
-                    f"<i>{meta.get('updated_at', '')}</i>"
+                    f"• <code>@{uname}</code> (IG ID: <code>{meta.get('ig_user_id') or 'N/A'}</code>, "
+                    f"via <code>{meta.get('auth_method', 'session')}</code>) — <i>{meta.get('updated_at', '')}</i>"
                 )
             txt = "\n".join(lines)
         await query.edit_message_text(txt, reply_markup=accounts_menu_keyboard(), parse_mode="HTML")
@@ -1062,17 +1326,20 @@ def main():
         entry_points=[
             CallbackQueryHandler(show_login_choices, pattern="^menu_login_choice$"),
             CallbackQueryHandler(start_new_login_from_callback, pattern="^start_new_login$"),
+            CallbackQueryHandler(start_sid_login_from_callback, pattern="^start_sid_login$"),
             CallbackQueryHandler(use_saved_account_callback, pattern="^use_saved:"),
             CallbackQueryHandler(start_template_edit, pattern="^tpl_edit_start$"),
         ],
         states={
             STATE_USERNAME: [
                 CallbackQueryHandler(start_new_login_from_callback, pattern="^start_new_login$"),
+                CallbackQueryHandler(start_sid_login_from_callback, pattern="^start_sid_login$"),
                 CallbackQueryHandler(use_saved_account_callback, pattern="^use_saved:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_username),
             ],
             STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_password)],
             STATE_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_2fa_code)],
+            STATE_SESSION_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_session_id)],
             STATE_MANUAL_THREADS: [
                 CallbackQueryHandler(on_thread_picker_callback, pattern="^(pick_tid:|pick_confirm|pick_manual|wiz_cancel)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_manual_threads_or_target),
