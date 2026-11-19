@@ -116,45 +116,6 @@ BASE_TEMPLATE = """<{TARGET}> Kɪ Mᴀᴀ Mᴏᴛɪ !< Gᴀɴᴅ Wᴀʟɪ> Rᴀ�
 
 MAX_RETRIES = 5
 
-IG_APP_PROFILES = [
-    {
-        "app_version": "312.0.0.29.111",
-        "version_code": "538748192",
-        "android_version": 33,
-        "android_release": "13",
-        "dpi": "420dpi",
-        "resolution": "1080x2400",
-        "manufacturer": "Samsung",
-        "device": "SM-S918B",
-        "model": "SM-S918B",
-        "cpu": "qcom",
-    },
-    {
-        "app_version": "315.0.0.25.109",
-        "version_code": "544912830",
-        "android_version": 34,
-        "android_release": "14",
-        "dpi": "440dpi",
-        "resolution": "1080x2400",
-        "manufacturer": "Google",
-        "device": "husky",
-        "model": "Pixel 8 Pro",
-        "cpu": "tensor",
-    },
-    {
-        "app_version": "310.0.0.32.104",
-        "version_code": "534119022",
-        "android_version": 33,
-        "android_release": "13",
-        "dpi": "480dpi",
-        "resolution": "1080x2340",
-        "manufacturer": "OnePlus",
-        "device": "CPH2451",
-        "model": "CPH2451",
-        "cpu": "qcom",
-    },
-]
-
 # Conversation states
 (
     STATE_USERNAME,
@@ -248,7 +209,11 @@ def get_active_template() -> str:
 def set_active_template(tpl: str):
     with store_lock:
         with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"template": tpl, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+            json.dump(
+                {"template": tpl, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                f,
+                indent=2,
+            )
 
 
 def reset_active_template():
@@ -260,69 +225,7 @@ def reset_active_template():
                 pass
 
 
-# ======================== IG VERSION & SESSION HELPERS ========================
-
-def is_outdated_app_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return any(
-        phrase in msg
-        for phrase in (
-            "out of date",
-            "outdated",
-            "update your app",
-            "upgrade your app",
-            "client is too old",
-            "app version",
-        )
-    )
-
-
-def apply_fresh_ig_headers(client: Client, profile_idx: int | None = None):
-    prof = (
-        IG_APP_PROFILES[profile_idx % len(IG_APP_PROFILES)]
-        if profile_idx is not None
-        else random.choice(IG_APP_PROFILES)
-    )
-    client.delay_range = [0, 0]
-
-    if hasattr(client, "app_version"):
-        client.app_version = prof["app_version"]
-    if hasattr(client, "version_code"):
-        client.version_code = prof["version_code"]
-    if hasattr(client, "android_version"):
-        client.android_version = prof["android_version"]
-    if hasattr(client, "android_release"):
-        client.android_release = prof["android_release"]
-    if hasattr(client, "phone_dpi"):
-        client.phone_dpi = prof["dpi"]
-    if hasattr(client, "phone_resolution"):
-        client.phone_resolution = prof["resolution"]
-    if hasattr(client, "phone_manufacturer"):
-        client.phone_manufacturer = prof["manufacturer"]
-    if hasattr(client, "phone_device"):
-        client.phone_device = prof["device"]
-    if hasattr(client, "phone_model"):
-        client.phone_model = prof["model"]
-    if hasattr(client, "cpu"):
-        client.cpu = prof["cpu"]
-
-    ua = (
-        f"Instagram {prof['app_version']} Android "
-        f"({prof['android_version']}/{prof['android_release']}; "
-        f"{prof['dpi']}; {prof['resolution']}; {prof['manufacturer']}; "
-        f"{prof['device']}; {prof['model']}; {prof['cpu']}; en_US; {prof['version_code']})"
-    )
-    try:
-        client.set_user_agent(ua)
-    except Exception:
-        pass
-    try:
-        if hasattr(client, "private") and hasattr(client.private, "headers"):
-            client.private.headers["User-Agent"] = ua
-            client.private.headers["X-IG-App-ID"] = "936619743392459"
-    except Exception:
-        pass
-
+# ======================== IG SESSION HELPERS ========================
 
 def clean_session_id_input(raw: str) -> str:
     val = raw.strip().strip('"').strip("'")
@@ -356,15 +259,14 @@ def resolve_username_from_client(client: Client, fallback: str = "") -> str:
     return f"user_{getattr(client, 'user_id', 'session')}"
 
 
-def build_client_with_session(username: str | None = None, profile_idx: int | None = None) -> Client:
+def build_client_with_session(username: str | None = None, fresh: bool = False) -> Client:
     client = Client()
-    apply_fresh_ig_headers(client, profile_idx=profile_idx)
-    if username:
+    client.delay_range = [0, 0]
+    if username and not fresh:
         session_path = os.path.join(DATA_DIR, f"ig_{username}.json")
         if os.path.exists(session_path):
             try:
                 client.load_settings(session_path)
-                apply_fresh_ig_headers(client, profile_idx=profile_idx)
             except Exception:
                 pass
     return client
@@ -379,54 +281,25 @@ def save_client_session(client: Client, username: str, auth_method: str = "passw
         pass
 
 
-def login_with_password_and_retry(client: Client, username: str, password: str, code: str | None = None):
-    last_exc = None
-    for idx in range(len(IG_APP_PROFILES)):
-        if idx > 0:
-            apply_fresh_ig_headers(client, profile_idx=idx)
-        try:
-            if code:
-                client.login(username, password, verification_code=code)
-            else:
-                client.login(username, password)
-            return client
-        except TwoFactorRequired:
-            raise
-        except BadPassword:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
-                continue
-            raise
-    raise last_exc
-
-
 def login_with_session_id_sync(session_id: str) -> tuple[Client, str]:
     cleaned = clean_session_id_input(session_id)
     if not cleaned:
         raise ValueError("Session ID cannot be empty.")
 
-    last_exc = None
-    for idx in range(len(IG_APP_PROFILES)):
-        client = Client()
-        apply_fresh_ig_headers(client, profile_idx=idx)
-        try:
-            client.login_by_sessionid(cleaned)
-            if not getattr(client, "user_id", None):
-                profile = client.account_info()
-                if getattr(profile, "pk", None):
-                    client.user_id = int(profile.pk)
-            if not getattr(client, "user_id", None):
-                raise RuntimeError("Session ID did not authenticate a valid user account.")
-            uname = resolve_username_from_client(client)
-            return client, uname
-        except Exception as exc:
-            last_exc = exc
-            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
-                continue
-            raise
-    raise last_exc
+    client = Client()
+    client.delay_range = [0, 0]
+    client.login_by_sessionid(cleaned)
+
+    if not getattr(client, "user_id", None):
+        profile = client.account_info()
+        if getattr(profile, "pk", None):
+            client.user_id = int(profile.pk)
+
+    if not getattr(client, "user_id", None):
+        raise RuntimeError("Session ID did not authenticate a valid user account.")
+
+    uname = resolve_username_from_client(client)
+    return client, uname
 
 
 def resume_saved_account_sync(username: str) -> Client:
@@ -434,24 +307,14 @@ def resume_saved_account_sync(username: str) -> Client:
     if not os.path.exists(session_path):
         raise RuntimeError(f"Saved session file for @{username} not found.")
 
-    last_exc = None
-    for idx in range(len(IG_APP_PROFILES)):
-        client = Client()
-        apply_fresh_ig_headers(client, profile_idx=idx)
-        try:
-            client.load_settings(session_path)
-            apply_fresh_ig_headers(client, profile_idx=idx)
-            profile = client.account_info()
-            if not getattr(profile, "pk", None) and not getattr(client, "user_id", None):
-                raise RuntimeError("Saved session is no longer valid.")
-            client.dump_settings(session_path)
-            return client
-        except Exception as exc:
-            last_exc = exc
-            if is_outdated_app_error(exc) or isinstance(exc, ClientForbiddenError):
-                continue
-            raise
-    raise last_exc
+    client = Client()
+    client.delay_range = [0, 0]
+    client.load_settings(session_path)
+    profile = client.account_info()
+    if not getattr(profile, "pk", None) and not getattr(client, "user_id", None):
+        raise RuntimeError("Saved session is no longer valid.")
+    client.dump_settings(session_path)
+    return client
 
 
 def fetch_threads_sync(client: Client):
@@ -718,10 +581,7 @@ def build_template_view_text() -> str:
 
 def build_tasks_summary() -> tuple[str, InlineKeyboardMarkup]:
     with tasks_lock:
-        snapshot = [
-            (tid, dict(info))
-            for tid, info in active_tasks.items()
-        ]
+        snapshot = [(tid, dict(info)) for tid, info in active_tasks.items()]
 
     if not snapshot:
         return (
@@ -855,9 +715,7 @@ async def receive_session_id(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Session ID cannot be empty. Paste it again or /cancel:")
         return STATE_SESSION_ID
 
-    status_msg = await update.message.reply_text(
-        "🔄 Authenticating with Session ID (with updated IG app headers)..."
-    )
+    status_msg = await update.message.reply_text("🔄 Authenticating with Session ID...")
 
     try:
         client, username = await asyncio.to_thread(login_with_session_id_sync, raw_sid)
@@ -954,13 +812,10 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-    client = build_client_with_session(username, profile_idx=0)
-
-    def _attempt_login():
-        return login_with_password_and_retry(client, username, password, code=None)
+    client = build_client_with_session(username, fresh=True)
 
     try:
-        logged_client = await asyncio.to_thread(_attempt_login)
+        await asyncio.to_thread(client.login, username, password)
     except TwoFactorRequired as exc:
         pending_logins[uid] = {
             "client": client,
@@ -990,7 +845,7 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     return await finish_auth_and_show_threads(
-        status_msg, context, logged_client, username, auth_method="password"
+        status_msg, context, client, username, auth_method="password"
     )
 
 
@@ -1018,11 +873,8 @@ async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = pending["username"]
     password = pending["password"]
 
-    def _verify_2fa():
-        return login_with_password_and_retry(client, username, password, code=code)
-
     try:
-        logged_client = await asyncio.to_thread(_verify_2fa)
+        await asyncio.to_thread(client.login, username, password, verification_code=code)
     except Exception as exc:
         await status_msg.edit_text(
             f"❌ 2FA verification failed: <code>{type(exc).__name__}: {str(exc)[:160]}</code>\n"
@@ -1033,7 +885,7 @@ async def receive_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending_logins.pop(uid, None)
     return await finish_auth_and_show_threads(
-        status_msg, context, logged_client, username, auth_method="password+2fa"
+        status_msg, context, client, username, auth_method="password+2fa"
     )
 
 
@@ -1218,7 +1070,7 @@ async def start_template_edit(update: Update, context: ContextTypes.DEFAULT_TYPE
     return STATE_EDIT_TEMPLATE
 
 
-async receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         return ConversationHandler.END
 
@@ -1236,7 +1088,7 @@ async receive_new_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_authorized(query.from_user.id):
